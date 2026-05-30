@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from typing import Any, TypeAlias, cast
@@ -31,10 +32,11 @@ from vllm.distributed import get_ep_group, get_tensor_model_parallel_world_size,
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
-from xlite._C import AttnMeta, AttnMHA, Runtime, ScoringFuncSigmoid, ScoringFuncSoftmax
+from xlite._C import AttnMeta, AttnMHA, AttnMLA, Runtime, ScoringFuncSigmoid, ScoringFuncSoftmax
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState, AscendMetadata
+from vllm_ascend.attention.mla_v1 import AscendMLAMetadata
 from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
 from vllm_ascend.xlite.utils import (
     AttnMetadataRouter,
@@ -493,6 +495,123 @@ class Glm4MoeXliteModel(StandardXliteModel):
         xlite_config.scoring_func = ScoringFuncSigmoid
         xlite_config.route_scale = hf_config.routed_scaling_factor
         xlite_config.gate_captured = False
+
+
+class DeepseekV3XliteModel(Glm4MoeXliteModel):
+    """xlite adapter for DeepseekV3 MoE architectures with MLA attention."""
+
+    _attn_metadata_type = AscendMLAMetadata
+    _supported_architectures = ["DeepseekV3ForCausalLM"]
+
+    def _build_model_config(self) -> None:
+        super()._build_model_config()
+        xlite_config, hf_config = self.xlite_config, self.hf_text_config
+
+        # MLA attention type
+        xlite_config.attn_type = AttnMLA
+        xlite_config.n_kv_heads = 1  # MLA uses latent cache
+        xlite_config.head_dim = 0  # Ignored by MLA
+
+        # MLA dimensions (override Llama's head_dim-based rope_head_dim)
+        xlite_config.rope_head_dim = hf_config.qk_rope_head_dim
+        xlite_config.nope_head_dim = hf_config.qk_nope_head_dim
+        xlite_config.q_lora_rank = hf_config.q_lora_rank
+        xlite_config.kv_lora_rank = hf_config.kv_lora_rank
+        xlite_config.v_head_dim = hf_config.v_head_dim
+        xlite_config.softmax_scale = (hf_config.qk_rope_head_dim + hf_config.qk_nope_head_dim) ** -0.5
+        # correct softmax_scale for yarn-style RoPE if max_seq_len > original_max_position_embeddings
+        rope_params: dict[str, int | float | str] = getattr(hf_config, "rope_parameters", {})
+        original_max_len = rope_params.get("original_max_position_embeddings", hf_config.max_position_embeddings)
+        if xlite_config.max_seq_len > original_max_len and "mscale" in rope_params and "factor" in rope_params:
+            mscale = 1.0 + 0.1 * rope_params["mscale"] * math.log(rope_params["factor"])
+            xlite_config.softmax_scale *= mscale**2
+
+        # MoE configuration (from Glm4MoeXliteModel, adapted for DeepseekV3)
+        xlite_config.n_expert_groups = getattr(hf_config, "n_group", 1)
+        xlite_config.n_limited_groups = getattr(hf_config, "topk_group", 1)
+
+    def _build_model(self) -> None:
+        super()._build_model()
+        xlite_model = self.xlite_model
+        layers, _ = self._get_layers_and_model_prefix()
+
+        # MLA attention weights
+        self.init_matmul_weights(layers, "mla_qkv_a", "self_attn.fused_qkv_a_proj")
+        self.init_matmul_weights(layers, "mla_q_b", "self_attn.q_b_proj")
+        xlite_model.mla_q_norm = get_layer_weights(layers, "self_attn.q_a_layernorm.weight")
+        xlite_model.mla_kv_b = get_layer_weights(layers, "self_attn.kv_b_proj.weight")
+        xlite_model.mla_kv_norm = get_layer_weights(layers, "self_attn.kv_a_layernorm.weight")
+
+        # kv_b_proj may be pruned (e.g., AscendSFAImpl) and need to be retrieved elsewhere and then reconstructed
+        if self.all_tensors_zero(xlite_model.mla_kv_b):
+            W_UV = get_layer_weights(layers, "self_attn.mla_attn.mla_attn.impl.W_UV")
+            W_UK_T = get_layer_weights(layers, "self_attn.mla_attn.mla_attn.impl.W_UK_T")
+            xlite_model.mla_kv_b = [
+                torch.cat([w_uk_t.permute(2, 0, 1), w_uv.transpose(0, 1)], dim=-1)
+                .view(self.xlite_config.kv_lora_rank, -1)
+                .T.contiguous()
+                for w_uk_t, w_uv in zip(W_UK_T, W_UV)
+            ]
+
+        if not self.quantization:
+            return
+
+        self.xlite_config.quant_attn_weight_nz = self.is_tensor_nz(xlite_model.mla_qkv_a[0])
+        self.xlite_config.quant_attn_weight_transpose = True
+        with xlite_model.condition(lambda tensors: not self.all_tensors_zero(tensors)):
+            xlite_model.mla_q_norm_bias = get_layer_weights(layers, "self_attn.q_a_layernorm.bias")
+            xlite_model.mla_kv_norm_bias = get_layer_weights(layers, "self_attn.kv_a_layernorm.bias")
+
+    def _precompute_freqs_cis(self) -> torch.Tensor:
+        """Precompute Yarn-style RoPE frequency cache for DeepseekV3 MLA attention.
+
+        Returns complex exponential tensor for rotary positional embeddings.
+        Format: [max_seq_len, rope_head_dim//2] complex tensor (torch.polar).
+        """
+        xlite_config, hf_config = self.xlite_config, self.hf_text_config
+
+        # Extract Yarn parameters from rope_parameters
+        rope_params = getattr(hf_config, "rope_parameters", {})
+        base = rope_params.get("rope_theta", getattr(hf_config, "rope_theta", 10000.0))
+        factor = rope_params.get("factor", 1.0)
+        original_seq_len = rope_params.get("original_max_position_embeddings", hf_config.max_position_embeddings)
+        beta_fast = rope_params.get("beta_fast", 32)
+        beta_slow = rope_params.get("beta_slow", 1)
+
+        dim = xlite_config.rope_head_dim  # qk_rope_head_dim (64 for DeepseekV3)
+        seqlen = xlite_config.max_seq_len
+
+        # Helper functions for Yarn frequency correction
+        def find_correction_dim(num_rotations, dim, base, max_seq_len):
+            return dim * math.log(max_seq_len / (num_rotations * 2 * math.pi)) / (2 * math.log(base))
+
+        def find_correction_range(low_rot, high_rot, dim, base, max_seq_len):
+            low = math.floor(find_correction_dim(low_rot, dim, base, max_seq_len))
+            high = math.ceil(find_correction_dim(high_rot, dim, base, max_seq_len))
+            return max(low, 0), min(high, dim - 1)
+
+        def linear_ramp_factor(min_val, max_val, dim):
+            if min_val == max_val:
+                max_val += 0.001
+            linear_func = (torch.arange(dim, dtype=torch.float32) - min_val) / (max_val - min_val)
+            return torch.clamp(linear_func, 0, 1)
+
+        # Compute base frequencies on CPU
+        freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device="cpu") / dim))
+
+        # Apply Yarn scaling if sequence length exceeds original
+        if seqlen > original_seq_len:
+            low, high = find_correction_range(beta_fast, beta_slow, dim, base, original_seq_len)
+            smooth = 1 - linear_ramp_factor(low, high, dim // 2)
+            freqs = freqs / factor * (1 - smooth) + freqs * smooth
+
+        # Create position indices and compute outer product
+        t = torch.arange(seqlen, dtype=torch.float32, device="cpu")
+        freqs = torch.outer(t, freqs)
+
+        # Return complex exponential format (as expected by xlite MLA forward)
+        freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+        return freqs_cis.to(device="npu")
 
 
 class MiniMaxM2XliteModel(StandardXliteModel):
