@@ -32,11 +32,12 @@ from vllm.distributed import get_ep_group, get_tensor_model_parallel_world_size,
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
-from xlite._C import AttnMeta, AttnMHA, AttnMLA, Runtime, ScoringFuncSigmoid, ScoringFuncSoftmax
+from xlite._C import AttnDSA, AttnMeta, AttnMHA, AttnMLA, Runtime, ScoringFuncSigmoid, ScoringFuncSoftmax
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState, AscendMetadata
 from vllm_ascend.attention.mla_v1 import AscendMLAMetadata
+from vllm_ascend.attention.sfa_v1 import AscendSFAMetadata
 from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
 from vllm_ascend.xlite.utils import (
     AttnMetadataRouter,
@@ -616,6 +617,37 @@ class DeepseekV3XliteModel(Glm4MoeXliteModel):
         # Return complex exponential format (as expected by xlite MLA forward)
         freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
         return freqs_cis.to(device="npu")
+
+
+class DeepseekV32XliteModel(DeepseekV3XliteModel):
+    """xlite adapter for Deepseek-V3.2/GLM-5/GLM-5.1 architectures with Deepseek sparse attention (DSA)."""
+
+    _attn_metadata_type = AscendSFAMetadata
+    _supported_architectures = ["DeepseekV32ForCausalLM", "GlmMoeDsaForCausalLM"]
+
+    def _build_model_config(self) -> None:
+        super()._build_model_config()
+        xlite_config, hf_config = self.xlite_config, self.hf_text_config
+
+        xlite_config.attn_type = AttnDSA
+        xlite_config.index_head_dim = hf_config.index_head_dim
+        xlite_config.index_n_heads = hf_config.index_n_heads
+        xlite_config.index_topk = hf_config.index_topk
+        xlite_config.index_rope_interleaved = getattr(hf_config, "indexer_rope_interleave", False)
+
+    def _build_model(self) -> None:
+        super()._build_model()
+        xlite_model = self.xlite_model
+        layers, _ = self._get_layers_and_model_prefix()
+
+        if (scale := get_dotted_attr(layers[0], "self_attn.indexer.softmax_scale")) is None:
+            scale = 1.0 / math.sqrt(self.hf_text_config.index_head_dim)
+        self.xlite_config.index_softmax_scale = float(scale)
+
+        self.init_matmul_weights(layers, "index_q_b", "self_attn.indexer.wq_b")
+        xlite_model.index_k_weights_proj = get_layer_weights(layers, "self_attn.indexer.wk_weights_proj.weight")
+        xlite_model.index_k_norm = get_layer_weights(layers, "self_attn.indexer.k_norm.weight")
+        xlite_model.index_k_norm_bias = get_layer_weights(layers, "self_attn.indexer.k_norm.bias")
 
 
 class MiniMaxM2XliteModel(LlamaXliteModel):
