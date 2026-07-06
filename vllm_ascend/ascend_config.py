@@ -481,7 +481,7 @@ class FinegrainedTPConfig:
     Configuration Object for finegrained_tp_config from additional_config
     """
 
-    def __init__(self, finegrained_tp_config: dict, vllm_config):
+    def __init__(self, finegrained_tp_config: dict, vllm_config: "VllmConfig"):
         self.oproj_tensor_parallel_size = finegrained_tp_config.get("oproj_tensor_parallel_size", 0)
         self.lmhead_tensor_parallel_size = finegrained_tp_config.get("lmhead_tensor_parallel_size", 0)
         self.embedding_tensor_parallel_size = finegrained_tp_config.get("embedding_tensor_parallel_size", 0)
@@ -625,23 +625,29 @@ class XliteGraphConfig:
     Configuration Object for xlite_graph_config from additional_config
     """
 
-    def __init__(self, xlite_graph_config, vllm_config):
-        self.enabled = xlite_graph_config.get("enabled", False)
-        self.full_mode = xlite_graph_config.get("full_mode", False)
-        if self.enabled:
-            if bool(vllm_config.speculative_config) and vllm_config.speculative_config.num_speculative_tokens != 1:
-                raise RuntimeError("Xlite graph mode only support speculative decoding with num_speculative_tokens=1.")
-            if vllm_config.parallel_config.pipeline_parallel_size > 1:
-                raise RuntimeError(
-                    "Xlite graph mode is not compatible with pipeline parallelism. "
-                    "Please set pipeline_parallel_size to 1."
-                )
-            if vllm_config.cache_config.block_size != 128:
-                logger.warning(
-                    "Current cache block size may not be optimal for xlite graph mode. "
-                    "current_block_size=%d, recommended_block_size=128.",
-                    vllm_config.cache_config.block_size,
-                )
+    def __init__(self, xlite_graph_config: dict[str, bool], vllm_config: "VllmConfig"):
+        self.enabled: bool = xlite_graph_config.get("enabled", False)
+        self.full_mode: bool = xlite_graph_config.get("full_mode", False)
+        if not self.enabled:
+            return
+
+        if spec := vllm_config.speculative_config:
+            # only support speculative methods with a sequential causal chain, e.g., `bonus_token, mtp_1, mtp_2, ...`
+            if (meth := str(spec.method)) not in ("mtp", "draft_model", "extract_hidden_states"):
+                raise RuntimeError("xlite graph only supports SpecDecode with a sequential causal chain.")
+            if meth in ("eagle3", "extract_hidden_states", "dflash"):
+                raise RuntimeError("xlite graph does not support SpecDecode with auxiliary hidden states extraction.")
+            if meth == "draft_model":
+                logger.warning_once("xlite graph may not be compatible with SpecDecode using draft_model.")
+        if vllm_config.parallel_config.pipeline_parallel_size > 1:
+            raise RuntimeError(
+                "xlite graph is not compatible with pipeline parallelism. Please set pipeline_parallel_size to 1."
+            )
+        if vllm_config.cache_config.block_size != 128:
+            logger.warning_once(
+                "Current cache block size may not be optimal for xlite graph mode: current=%d, recommended=128.",
+                vllm_config.cache_config.block_size,
+            )
 
 
 class ProfilingChunkConfig:
@@ -863,7 +869,7 @@ def _is_ascend_config_initialized(config: AscendConfig | None) -> bool:
     return hasattr(config, "ascend_compilation_config") and hasattr(config, "eplb_config")
 
 
-def init_ascend_config(vllm_config):
+def init_ascend_config(vllm_config: "VllmConfig") -> AscendConfig:
     additional_config = vllm_config.additional_config if vllm_config.additional_config is not None else {}
     refresh = additional_config.get("refresh", False) if additional_config else False
     global _ASCEND_CONFIG

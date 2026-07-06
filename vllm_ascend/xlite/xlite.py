@@ -299,11 +299,13 @@ class LlamaXliteModel(XliteModel):
         xlite_config.attn_type = AttnMHA
         xlite_config.scoring_func = ScoringFuncSoftmax
         xlite_config.weight_nz = get_ascend_config().weight_nz_mode == 2
-        xlite_config.max_m = (
-            vllm_config.scheduler_config.max_num_batched_tokens
-            if get_ascend_config().xlite_graph_config.full_mode
-            else vllm_config.scheduler_config.max_num_seqs
-        )
+        xlite_config.max_m = vllm_config.scheduler_config.max_num_batched_tokens
+        if not get_ascend_config().xlite_graph_config.full_mode:
+            xlite_config.max_m = min(
+                xlite_config.max_m,
+                vllm_config.scheduler_config.max_num_seqs
+                * (spec.num_speculative_tokens + 1 if (spec := vllm_config.speculative_config) else 1),
+            )
         xlite_config.max_batch_size = vllm_config.scheduler_config.max_num_seqs
         xlite_config.max_seq_len = vllm_config.model_config.max_model_len
         xlite_config.block_size = vllm_config.cache_config.block_size
@@ -755,8 +757,7 @@ class XliteWrapper:
         if self.xlite_rt.init_tensor_pool(rt_pool_size) != 0:
             raise ValueError(f"xlite wrapper init failed! runtime pool size: {rt_pool_size} MB")
 
-        max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-        self.hidden_states = torch.empty(max_num_tokens, hidden_size, device=self.device, dtype=dtype)
+        self.hidden_states = torch.empty(xlite_config.max_m, hidden_size, device=self.device, dtype=dtype)
 
     def __getattr__(self, key: str) -> Any:
         """Proxy unknown attributes to the wrapped runnable model.
