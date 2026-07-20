@@ -444,7 +444,7 @@ class QwenMoeXliteModel(LlamaXliteModel):
 
         if self.quantization:
             kwargs["post_processor"] = self._transform_deq_scale
-            xlite_model.re_up_gate_scale = get_layer_weights(layers, f"{prefix}w13_weight_scale_fp32", **kwargs)
+            xlite_model.re_up_gate_scale = get_layer_weights(layers, f"{prefix}w13_weight_scale", **kwargs)
             xlite_model.re_down_scale = get_layer_weights(layers, f"{prefix}w2_weight_scale", **kwargs)
 
 
@@ -495,7 +495,7 @@ class Glm4MoeXliteModel(LlamaXliteModel):
 
         if self.quantization:
             kwargs["post_processor"] = self._transform_deq_scale
-            xlite_model.re_up_gate_scale = get_layer_weights(layers, f"{prefix}w13_weight_scale_fp32", **kwargs)
+            xlite_model.re_up_gate_scale = get_layer_weights(layers, f"{prefix}w13_weight_scale", **kwargs)
             xlite_model.re_down_scale = get_layer_weights(layers, f"{prefix}w2_weight_scale", **kwargs)
 
 
@@ -539,7 +539,7 @@ class MiniMaxM2XliteModel(LlamaXliteModel):
 
         if self.quantization:
             kwargs["post_processor"] = self._transform_deq_scale
-            xlite_model.re_up_gate_scale = get_layer_weights(layers, f"{prefix}w13_weight_scale_fp32", **kwargs)
+            xlite_model.re_up_gate_scale = get_layer_weights(layers, f"{prefix}w13_weight_scale", **kwargs)
             xlite_model.re_down_scale = get_layer_weights(layers, f"{prefix}w2_weight_scale", **kwargs)
 
 
