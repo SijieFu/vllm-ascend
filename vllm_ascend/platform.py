@@ -981,6 +981,20 @@ def _update_compilation_modes(vllm_config: VllmConfig, ascend_config) -> None:
     # Update compilation mode in some cases
     enforce_eager = getattr(model_config, "enforce_eager", False)
 
+    # Update cudagraph_mode in some cases (read ascend_config.xlite_graph_config)
+    if (xlite_config := ascend_config.xlite_graph_config).enabled:
+        if xlite_config.full_mode and vllm_config.speculative_config is None:
+            enforce_eager = True
+            compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+        elif xlite_config.full_mode:  # and vllm_config.speculative_config is not None:
+            decode_mode = compilation_config.cudagraph_mode.decode_mode()
+            compilation_config.cudagraph_mode = decode_mode and CUDAGraphMode((decode_mode.value, 0))
+        elif compilation_config.cudagraph_mode:
+            compilation_config.cudagraph_mode = compilation_config.cudagraph_mode.mixed_mode()
+        enforce_eager = enforce_eager or compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+        model_config.enforce_eager = enforce_eager
+        logger.info("Xlite graph enabled; falling back cudagraph_mode to %s", compilation_config.cudagraph_mode)
+
     if enforce_eager:
         logger.info("Compilation disabled, using eager mode by default")
         compilation_config.mode = CompilationMode.NONE
@@ -993,18 +1007,6 @@ def _update_compilation_modes(vllm_config: VllmConfig, ascend_config) -> None:
             compilation_config.mode,
         )
         compilation_config.mode = CompilationMode.NONE
-
-    # Update cudagraph_mode in some cases (read ascend_config.xlite_graph_config)
-    xlite_graph_config = ascend_config.xlite_graph_config
-    if xlite_graph_config.enabled:
-        if xlite_graph_config.full_mode and vllm_config.speculative_config is None:
-            logger.info("ACLGraph has been disabled when speculation is disabled in xlite full mode")
-            enforce_eager = True
-            model_config.enforce_eager = True
-            compilation_config.cudagraph_mode = CUDAGraphMode.NONE
-        else:
-            logger.info("Falling back to FULL_DECODE_ONLY under xlite decode-only mode")
-            compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
 
     # Encoder-decoder models currently only support PIECEWISE mode
     # TODO(Jian Li): Confirm this behavior and explain why

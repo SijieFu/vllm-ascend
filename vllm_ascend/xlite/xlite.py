@@ -315,11 +315,11 @@ class StandardXliteModel(XliteModelBase):
         xlite_config.attn_type = AttnMHA
         xlite_config.scoring_func = ScoringFuncSoftmax
         xlite_config.weight_nz = get_ascend_config().weight_nz_mode == 2
-        xlite_config.max_m = (
-            math.ceil(vllm_config.scheduler_config.max_num_batched_tokens / tp_size) * tp_size
-            if get_ascend_config().xlite_graph_config.full_mode
-            else vllm_config.scheduler_config.max_num_seqs
-        )
+        max_m = vllm_config.scheduler_config.max_num_batched_tokens
+        if not get_ascend_config().xlite_graph_config.full_mode:
+            n_spec_tokens = getattr(vllm_config.speculative_config, "num_speculative_tokens", 0)
+            max_m = min(max_m, vllm_config.scheduler_config.max_num_seqs * (n_spec_tokens + 1))
+        xlite_config.max_m = (max_m + tp_size - 1) // tp_size * tp_size  # round up to nearest multiple of tp_size
         xlite_config.max_batch_size = vllm_config.scheduler_config.max_num_seqs
         xlite_config.max_seq_len = vllm_config.model_config.max_model_len
         xlite_config.block_size = vllm_config.cache_config.block_size
@@ -519,7 +519,7 @@ class DeepseekV3XliteModel(Glm4MoeXliteModel):
         xlite_config.softmax_scale = (hf_config.qk_rope_head_dim + hf_config.qk_nope_head_dim) ** -0.5
         # correct softmax_scale for yarn-style RoPE if max_seq_len > original_max_position_embeddings
         rope_params: dict[str, int | float | str] = getattr(hf_config, "rope_parameters", {})
-        original_max_len = rope_params.get("original_max_position_embeddings", hf_config.max_position_embeddings)
+        original_max_len: int = rope_params.get("original_max_position_embeddings", hf_config.max_position_embeddings)  # type: ignore[assignment]
         if xlite_config.max_seq_len > original_max_len and "mscale" in rope_params and "factor" in rope_params:
             mscale: float = 1.0 + 0.1 * rope_params["mscale"] * math.log(rope_params["factor"])  # type: ignore[operator,arg-type]
             xlite_config.softmax_scale *= mscale**2
@@ -688,6 +688,10 @@ class XliteWrapper:
         self.runnable = runnable
         self.device = device
         self.full_mode: bool = get_ascend_config().xlite_graph_config.full_mode
+        self.decode_only_states: tuple[AscendAttentionState, ...] = (
+            AscendAttentionState.DecodeOnly,
+            AscendAttentionState.SpecDecoding,
+        )
 
         self.data_parallel_size = vllm_config.parallel_config.data_parallel_size
         self.adapter_xlite_model = get_adapter_xlite_model(runnable, vllm_config)
@@ -709,8 +713,8 @@ class XliteWrapper:
         if self.xlite_rt.init_tensor_pool(rt_pool_size) != 0:
             raise ValueError(f"xlite wrapper init failed! runtime pool size: {rt_pool_size} MB")
 
-        max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-        self.hidden_states = torch.empty(max_num_tokens, hidden_size, device=self.device, dtype=dtype)
+        self.max_m = xlite_config.max_m
+        self.hidden_states = torch.empty(self.max_m, hidden_size, device=self.device, dtype=dtype)
 
     def __getattr__(self, key: str) -> Any:
         """Proxy unknown attributes to the wrapped runnable model.
@@ -740,21 +744,22 @@ class XliteWrapper:
             return runnable.unwrap()
         return runnable
 
-    def register_kv_caches(self, kv_caches: Any) -> None:
+    def register_kv_caches(self, kv_caches: list[tuple[torch.Tensor, ...]]) -> None:
         """Register KV cache references used by xlite runtime.
 
         Args:
-            kv_caches (Any): Runtime KV cache handles or tensors.
+            kv_caches (list[tuple[torch.Tensor, ...]]): Runtime KV cache handles or tensors.
         """
-        if len(kv_caches) == 2 * self.adapter_xlite_model.xlite_config.n_layers:
+        if len(kv_caches) >= (doubled_n_layers := 2 * self.adapter_xlite_model.xlite_config.n_layers):
             # For DSA, the kv_caches are passed as [(indexer_k_cache,), (k_nope_cache, pe_cache), ...]
             # TODO: consider the compatibility with `enable_sparse_sfa_c8` and `enable_sparse_li_c8`
+            kv_caches = kv_caches[-doubled_n_layers:]
             kv_caches = [main_c[:2] + indexer_c[:1] for main_c, indexer_c in zip(kv_caches[1::2], kv_caches[::2])]
         self.kv_caches = kv_caches
 
     def __call__(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -763,7 +768,7 @@ class XliteWrapper:
         """Run one forward step through xlite graph or fallback runnable path.
 
         Args:
-            input_ids (torch.Tensor): Token IDs for current step.
+            input_ids (torch.Tensor | None): Token IDs for current step.
             positions (torch.Tensor): Position IDs used by attention.
             intermediate_tensors (IntermediateTensors | None): Optional intermediate tensors from pipeline stages.
             inputs_embeds (torch.Tensor | None): Optional external input embeddings (e.g. multimodal/deepstack
@@ -774,7 +779,9 @@ class XliteWrapper:
             XliteForwardResult: Forward outputs from xlite graph or the original runnable implementation.
         """
         forward_context = get_forward_context()
-        if getattr(forward_context, "in_profile_run", False):
+        attn_metadata: Any = forward_context.attn_metadata
+        num_tokens = forward_context.max_tokens_across_dp
+        if forward_context.in_profile_run or attn_metadata is None or num_tokens <= 0:
             if self.full_mode:
                 # In full mode, xlite handles both prefill and decode, and aclgraph runnable should not reserve memory.
                 # This is to avoid redundant memory allocation that reduces KV cache capacity and regresses performance.
@@ -783,42 +790,19 @@ class XliteWrapper:
                 return self.hidden_states
             return self.runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs)
 
-        attn_metadata: Any = forward_context.attn_metadata
-        if attn_metadata is None:
-            return self.runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs)
-
         attn_metadata = attn_metadata[0] if isinstance(attn_metadata, list) else attn_metadata
         attn_metadata = attn_metadata.get("model.layers.0.self_attn.attn", next(iter(attn_metadata.values()), None))
-        if not isinstance(attn_metadata, self.adapter_xlite_model._attn_metadata_type):
-            return self.runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs)
-
-        with_prefill = attn_metadata.attn_state not in (
-            AscendAttentionState.DecodeOnly,
-            AscendAttentionState.SpecDecoding,
-        )
-
-        # Full: graph for prefill and decode
-        # Decode-Only: runnable for prefill, graph for decode
-        if not self.full_mode and self.data_parallel_size > 1:
-            num_tokens = forward_context.batch_descriptor.num_tokens
-            num_reqs = forward_context.batch_descriptor.num_reqs
-            use_xlite_graph = num_reqs is not None and num_tokens <= num_reqs
-        else:
-            use_xlite_graph = not with_prefill or self.full_mode
-
-        if not use_xlite_graph:
-            # fall back to runnable for prefill in decode-only mode
-            # or when the number of tokens exceeds the graph capacity in non-full mode
+        if not self.full_mode and (attn_metadata.attn_state not in self.decode_only_states or num_tokens > self.max_m):
+            # In xlite decode-only mode, prefill or mixed batches fall back to the native vllm-ascend runnable.
+            # Same when the number of tokens exceeds the preallocated hidden state buffer, e.g., certain profile runs
             return self.runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs)
 
         attn_metadata_router = AttnMetadataRouter(attn_metadata=attn_metadata, device="cpu")
+        num_actual_tokens = attn_metadata_router.num_actual_tokens
         seq_lens = attn_metadata_router.seq_lens
         cum_query_lens = attn_metadata_router.cu_query_lens[-seq_lens.size(0) :]
         query_lens = torch.diff(cum_query_lens, prepend=seq_lens.new_zeros(1))
         cached_lens = torch.clamp(seq_lens - query_lens, min=0)
-
-        num_actual_tokens = attn_metadata_router.num_actual_tokens
-        num_tokens = forward_context.max_tokens_across_dp
 
         xlite_attn_metadata = AttnMeta()
         xlite_attn_metadata.lens = query_lens.tolist()
@@ -826,14 +810,14 @@ class XliteWrapper:
         xlite_attn_metadata.block_tables_cpu = attn_metadata_router.block_tables.tolist()
         if positions.ndim == 2:
             xlite_attn_metadata.positions = positions[:, :num_actual_tokens].contiguous()
-            positions = positions[0]
         else:
             xlite_attn_metadata.positions = positions
 
         # under DP, `num_tokens` is the max number of tokens across all DP ranks for data alignment
         h = self.hidden_states[:num_tokens]
         stream = torch.npu.current_stream().npu_stream
-        if inputs_embeds is None:
+        input_ids = cast(torch.Tensor, input_ids)
+        if inputs_embeds is None or inputs_embeds.size(0) == 0:
             self.xlite_model.forward(
                 self.xlite_rt, input_ids, xlite_attn_metadata, self.kv_caches, self.freq_cis, h, stream
             )
@@ -852,6 +836,8 @@ class XliteWrapper:
                 stream,
                 xlite_deepstack_input_embeds,
             )
-            if xlite_deepstack_input_embeds and hasattr(self.runnable, "_clear_deepstack_input_embeds"):
-                self.runnable._clear_deepstack_input_embeds(inputs_embeds.size(0))
-        return h[:num_actual_tokens]
+            if deepstack_input_embeds and callable(
+                _clear_stack := getattr(self.runnable, "_clear_deepstack_input_embeds", None)
+            ):
+                _clear_stack(inputs_embeds.size(0))
+        return h[:num_actual_tokens] if self.data_parallel_size == 1 else h[:num_tokens]

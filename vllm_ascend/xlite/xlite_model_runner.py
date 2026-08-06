@@ -18,6 +18,7 @@
 # isort: skip_file
 import torch.nn as nn
 from vllm.config import CUDAGraphMode
+from vllm.logger import logger
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
@@ -27,17 +28,31 @@ class XliteModelRunner(NPUModelRunner):
         """See :meth:`NPUModelRunner.get_model` and :meth:`XliteWrapper.unwrap` for details."""
         if not hasattr(self, "xlite_model"):
             return super().get_model()
-        return self.xlite_model.unwrap()
+        return self.xlite_model.unwrap()  # type: ignore[return-value]
 
     def load_model(self) -> None:
         from vllm_ascend.xlite.xlite import XliteWrapper
 
         super().load_model()
-        self.model = self.xlite_model = XliteWrapper(self.model, self.vllm_config, device=self.device)
+        self._model = self.model
+        self.model = self.xlite_model = XliteWrapper(self._model, self.vllm_config, device=self.device)  # type: ignore[assignment]
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         super().initialize_kv_cache(kv_cache_config)
-        self.xlite_model.register_kv_caches(self.kv_caches)
+        self.xlite_model.register_kv_caches(self.kv_caches)  # type: ignore[arg-type]
+
+        # check attention metadata backend compatibility
+        ascend_metadata_builder = self.attn_groups[0][-1].get_metadata_builder(0)
+        ascend_metadata_cls = getattr(ascend_metadata_builder, "metadata_cls", ascend_metadata_builder)
+        xlite_expects = self.xlite_model.adapter_xlite_model._attn_metadata_type
+        if ascend_metadata_cls != xlite_expects and (
+            not isinstance(xlite_expects, tuple) or ascend_metadata_cls not in xlite_expects
+        ):
+            logger.error(
+                "Attention metadata mismatch: xlite expects (one of) %s, but got %s. Be aware of runtime issues.",
+                xlite_expects,
+                ascend_metadata_cls,
+            )
 
     def _should_build_dummy_attn_metadata(
         self,
