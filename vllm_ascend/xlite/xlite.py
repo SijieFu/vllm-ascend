@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
@@ -674,6 +675,8 @@ def get_adapter_xlite_model(runnable: nn.Module, vllm_config: VllmConfig) -> Xli
 class XliteWrapper:
     """A graph-based wrapper that dispatches between xlite and runnable paths."""
 
+    break_at_next_prefill = False
+
     def __init__(self, runnable: nn.Module, vllm_config: VllmConfig, device: torch.device) -> None:
         """Initialize xlite runtime, model tensors, and hidden-state workspace.
 
@@ -797,12 +800,50 @@ class XliteWrapper:
             # Same when the number of tokens exceeds the preallocated hidden state buffer, e.g., certain profile runs
             return self.runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs)
 
+        panic_mode = positions.flatten().max().item() > 40000
+        if panic_mode:
+            if self.device.index == 0:
+                setattr(logger, "_xstate", "PANIC")  # noqa: B010
+            logger.setLevel(logging.DEBUG)
+        else:
+            setattr(logger, "_xstate", "NORMAL")  # noqa: B010
+            logger.setLevel(logging.INFO)
+        if self.break_at_next_prefill:
+            raise RuntimeError("panic mode triggered")
+
         attn_metadata_router = AttnMetadataRouter(attn_metadata=attn_metadata, device="cpu")
         num_actual_tokens = attn_metadata_router.num_actual_tokens
         seq_lens = attn_metadata_router.seq_lens
         cum_query_lens = attn_metadata_router.cu_query_lens[-seq_lens.size(0) :]
         query_lens = torch.diff(cum_query_lens, prepend=seq_lens.new_zeros(1))
         cached_lens = torch.clamp(seq_lens - query_lens, min=0)
+
+        if panic_mode:
+            rows = positions.flatten()[:num_actual_tokens] > 40000
+            if self.device.index == 0:
+                logger.info(
+                    "xlite forward: num_tokens=%d, num_actual_tokens=%d, seq_lens=%s, query_lens=%s, cached_lens=%s, "
+                    "cum_query_lens=%s",
+                    num_tokens,
+                    num_actual_tokens,
+                    seq_lens.tolist(),
+                    query_lens.tolist(),
+                    cached_lens.tolist(),
+                    cum_query_lens.tolist(),
+                )
+                logger.info(
+                    "xlite forward: block_tables=%s, positions=%s, slot_mapping=%s",
+                    attn_metadata_router.block_tables.tolist(),
+                    positions.flatten().tolist()[:num_actual_tokens],
+                    attn_metadata.slot_mapping.flatten().tolist()[:num_actual_tokens],
+                )
+            hidden_states = self.runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs)
+            if self.device.index == 0:
+                rows = [0, 1, 2, -3, -2, -1] if len(hidden_states) > 6 else list(range(len(hidden_states)))
+                logger.info(
+                    "panic mode aclgraph: hidden_states=%s",
+                    hidden_states[rows][:, [0, 1, 2, -3, -2, -1]].tolist(),
+                )
 
         xlite_attn_metadata = AttnMeta()
         xlite_attn_metadata.lens = query_lens.tolist()
@@ -840,4 +881,11 @@ class XliteWrapper:
                 _clear_stack := getattr(self.runnable, "_clear_deepstack_input_embeds", None)
             ):
                 _clear_stack(inputs_embeds.size(0))
+        if panic_mode and self.device.index == 0:
+            rows = [0, 1, 2, -3, -2, -1] if num_actual_tokens > 6 else list(range(num_actual_tokens))
+            logger.info(
+                "panic mode xlite: hidden_states=%s",
+                h[:num_actual_tokens][rows][:, [0, 1, 2, -3, -2, -1]].tolist(),
+            )
+        self.break_at_next_prefill = panic_mode
         return h[:num_actual_tokens] if self.data_parallel_size == 1 else h[:num_tokens]
