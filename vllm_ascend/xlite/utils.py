@@ -71,7 +71,7 @@ class AttributeSetterMixin:
 
     _on_missing_attr: Literal["raise", "warn", "ignore"] = "warn"
     """Behavior when attempting to set a missing attribute. If `warn`, a logger must be provided to log a warning."""
-    _logger: Logger | None = None
+    _logger: Logger | None = logger
     """Optional logger for warning about missing attributes. If None, no warnings will be logged."""
 
     def __init_subclass__(cls) -> None:
@@ -133,15 +133,9 @@ class AttributeSetterMixin:
 class XModel(AttributeSetterMixin, Model):
     """:mod:`xlite._C.Model` subclass with safe attribute setting for better backwards compatibility."""
 
-    if torch.distributed.get_rank() == 0:
-        _logger = logger
-
 
 class XModelConfig(AttributeSetterMixin, ModelConfig):
     """:mod:`xlite._C.ModelConfig` subclass with safe attribute setting for better backwards compatibility."""
-
-    if torch.distributed.get_rank() == 0:
-        _logger = logger
 
 
 @dataclass

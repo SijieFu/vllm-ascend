@@ -63,10 +63,12 @@ logger.info(
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
     from vllm.utils import FlexibleArgumentParser
+    from vllm_ascend.ascend_config import AscendConfig
 else:
     ModelConfig = None
     VllmConfig = None
     FlexibleArgumentParser = None
+    AscendConfig = None
 
 _CUSTOM_OP_REGISTERED = False
 # Delete after the driver is released; temporarily hard-coded to 4
@@ -955,7 +957,7 @@ def _validate_kv_load_failure_policy(vllm_config: VllmConfig) -> None:
             raise AssertionError("Hybrid models do not support recompute mode kv load failure policy now.")
 
 
-def _update_compilation_modes(vllm_config: VllmConfig, ascend_config) -> None:
+def _update_compilation_modes(vllm_config: VllmConfig, ascend_config: AscendConfig) -> None:
     """Update compilation / cudagraph modes.
 
     Syncs the Ascend compilation config into additional_config, then derives
@@ -986,6 +988,20 @@ def _update_compilation_modes(vllm_config: VllmConfig, ascend_config) -> None:
     # Update compilation mode in some cases
     enforce_eager = getattr(model_config, "enforce_eager", False)
 
+    # Update cudagraph_mode in some cases (read ascend_config.xlite_graph_config)
+    if (xlite_config := ascend_config.xlite_graph_config).enabled:
+        # TODO: full mode --> enforce_eager
+        if (spec_config := vllm_config.speculative_config) is not None and spec_config.enforce_eager is None:
+            spec_config.enforce_eager = enforce_eager
+
+        mixed_mode = CUDAGraphMode.NONE if xlite_config.full_mode else compilation_config.cudagraph_mode.mixed_mode()
+        decode_mode = CUDAGraphMode.NONE if spec_config is not None else compilation_config.cudagraph_mode.decode_mode()
+        compilation_config.cudagraph_mode = (
+            mixed_mode if mixed_mode == decode_mode else CUDAGraphMode((decode_mode.value, mixed_mode.value))
+        )
+        model_config.enforce_eager = enforce_eager = enforce_eager or not compilation_config.cudagraph_mode
+        logger.info("Xlite graph enabled; falling back cudagraph_mode to %s", compilation_config.cudagraph_mode)
+
     if enforce_eager:
         logger.info("Compilation disabled, using eager mode by default")
         compilation_config.mode = CompilationMode.NONE
@@ -998,18 +1014,6 @@ def _update_compilation_modes(vllm_config: VllmConfig, ascend_config) -> None:
             compilation_config.mode,
         )
         compilation_config.mode = CompilationMode.NONE
-
-    # Update cudagraph_mode in some cases (read ascend_config.xlite_graph_config)
-    xlite_graph_config = ascend_config.xlite_graph_config
-    if xlite_graph_config.enabled:
-        if xlite_graph_config.full_mode and vllm_config.speculative_config is None:
-            logger.info("ACLGraph has been disabled when speculation is disabled in xlite full mode")
-            enforce_eager = True
-            model_config.enforce_eager = True
-            compilation_config.cudagraph_mode = CUDAGraphMode.NONE
-        else:
-            logger.info("Falling back to FULL_DECODE_ONLY under xlite decode-only mode")
-            compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
 
     # Encoder-decoder models currently only support PIECEWISE mode
     # TODO(Jian Li): Confirm this behavior and explain why
