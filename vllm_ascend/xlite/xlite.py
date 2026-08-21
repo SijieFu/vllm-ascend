@@ -603,7 +603,7 @@ class DeepseekV3XliteModel(Glm4MoeXliteModel):
 
 
 class DeepseekV32XliteModel(DeepseekV3XliteModel):
-    """xlite adapter for Deepseek-V3.2/GLM-5/GLM-5.1 architectures with Deepseek sparse attention (DSA)."""
+    """xlite adapter for Deepseek-V3.2/GLM-5.x architectures with Deepseek sparse attention (DSA)."""
 
     _attn_metadata_type = AscendSFAMetadata  # type: ignore[assignment]
     _supported_architectures = ["DeepseekV32ForCausalLM", "GlmMoeDsaForCausalLM"]
@@ -617,6 +617,8 @@ class DeepseekV32XliteModel(DeepseekV3XliteModel):
         xlite_config.index_n_heads = hf_config.index_n_heads
         xlite_config.index_topk = hf_config.index_topk
         xlite_config.index_rope_interleaved = getattr(hf_config, "indexer_rope_interleave", False)
+        indexer_types: list[str] = getattr(hf_config, "indexer_types", []) or []
+        xlite_config.indexer_skip_layers = list(map(lambda x: str(x).lower().startswith("f"), indexer_types))  # full
 
     def _build_model(self) -> None:
         super()._build_model()
