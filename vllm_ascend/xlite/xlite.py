@@ -46,7 +46,10 @@ from vllm_ascend.xlite.utils import (
 )
 
 if TYPE_CHECKING:
-    from vllm_ascend.xlite.xlite_model_runner import XliteModelRunner
+    from vllm_ascend.xlite.xlite_model_runner import XliteModelRunner as XliteModelRunnerV1
+    from vllm_ascend.xlite.xlite_model_runner import XliteModelRunnerV2
+
+    XliteModelRunner: TypeAlias = XliteModelRunnerV1 | XliteModelRunnerV2
 
 XliteForwardResult: TypeAlias = torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]
 
@@ -780,7 +783,13 @@ class XliteWrapper:
         attn_metadata = attn_metadata.get("model.layers.0.self_attn.attn", next(iter(attn_metadata.values()), None))
         # Since v0.28.0, batches are routed by token count (max across DP ranks) instead of the batch attention
         # state: batches within the preallocated budget run on xlite, others fall back to the native acl runnable.
-        if (num_tokens := forward_context.max_tokens_across_dp) > self.max_tokens:
+        num_tokens: int
+        if (num_tokens := getattr(forward_context, "max_tokens_across_dp", None)) is None:  # type: ignore[assignment]
+            if (dp_metadata := forward_context.dp_metadata) is not None:
+                num_tokens = dp_metadata.num_tokens_across_dp_cpu.max().item()
+            else:
+                num_tokens = attn_metadata.num_actual_tokens
+        if num_tokens > self.max_tokens:
             if self.full_mode:
                 logger.warning_once(
                     "xlite: token number exceeded expected limit (%d >%d), consider opening an issue at %s",
@@ -840,3 +849,7 @@ class XliteWrapper:
             ):
                 _clear_stack(inputs_embeds.size(0))
         return h[:num_actual_tokens] if self.data_parallel_size == 1 else h[:num_tokens]
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | torch.nn.Module:
+        # TODO: consider implementing a custom logits computation path for xlite to avoid falling back to the native
+        return self.npu_runnable.compute_logits(hidden_states)  # type: ignore[attr-defined]
