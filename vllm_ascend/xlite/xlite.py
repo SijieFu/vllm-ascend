@@ -20,7 +20,8 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Generator, Sequence
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
 import regex as re
@@ -737,6 +738,9 @@ class XliteWrapper:
         # `full_mode` only sizes the token budget (see the comment in `StandardXliteModel._build_config`).
         self.full_mode: bool = get_ascend_config().xlite_graph_config.full_mode
         self.data_parallel_size = vllm_config.parallel_config.data_parallel_size
+        # The runner generation decides the output-shape contract; see `XliteWrapper.__call__`.
+        self.use_v2_model_runner: bool = vllm_config.use_v2_model_runner
+        self._is_dummy_batch: bool = False
 
         set_dummy_tensor(torch.empty(1, device=device, dtype=vllm_config.model_config.dtype))
         self.adapter_xlite_model = get_adapter_xlite_model(npu_runner, vllm_config)  # python adapter instance
@@ -795,6 +799,21 @@ class XliteWrapper:
         """
         self.kv_caches = self.adapter_xlite_model.extract_kv_cache(kv_caches)
 
+    @contextmanager
+    def dummy_batch(self) -> Generator[None, None, None]:
+        """Mark the enclosed run as a DP dummy batch.
+
+        Idle DP ranks run ``NPUWorker.execute_dummy_batch`` through the xlite forward to keep the DP collectives
+        aligned. xlite only requires such a rank to contribute a minimum of one token for one request, so while
+        the flag is set the wrapper clamps every request-derived quantity to exactly that. The DP-agreed output
+        buffer size is unaffected (see `XliteWrapper.__call__`).
+        """
+        self._is_dummy_batch = True
+        try:
+            yield
+        finally:
+            self._is_dummy_batch = False
+
     def __call__(
         self,
         input_ids: torch.Tensor | None,
@@ -823,6 +842,11 @@ class XliteWrapper:
         attn_metadata = attn_metadata.get("model.layers.0.self_attn.attn", next(iter(attn_metadata.values()), None))
         # Since v0.28.0, batches are routed by token count (max across DP ranks) instead of the batch attention
         # state: batches within the preallocated budget run on xlite, others fall back to the native acl runnable.
+        # Under DP the count comes from the DP-all-reduced `num_tokens_across_dp_cpu`, which every rank derives
+        # identically. In graph modes the synced entries hold the agreed bucket-padded count instead of the max
+        # ACTUAL count: a safe over-approximation, as the xlite C++ side only requires the per-rank output rows
+        # to be DP-uniform and never smaller than the rank's own token count (pad rows are never routed to
+        # experts, so garbage in them cannot propagate).
         num_tokens: int
         if (num_tokens := _EXTRA_CTX.max_tokens_across_dp) is None:
             if (dp_metadata := forward_context.dp_metadata) is not None:
@@ -839,30 +863,73 @@ class XliteWrapper:
                 )
             return self.npu_runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs)
 
+        # `input_ids` / `inputs_embeds` are views of the runner's padded input buffers, so their length is the
+        # padded token count (`num_tokens_after_padding` under V2, `num_tokens_padded` under V1) — the number of
+        # output rows the runner's own consumers expect from the model.
+        if input_ids is not None:
+            num_padded_input_tokens = input_ids.size(0)
+        elif inputs_embeds is not None:
+            num_padded_input_tokens = inputs_embeds.size(0)
+        else:  # defensive: the model always receives at least one of the two
+            num_padded_input_tokens = attn_metadata.num_actual_tokens
+
         attn_metadata_router = AttnMetadataRouter(attn_metadata=attn_metadata, device="cpu")
         num_actual_tokens = attn_metadata_router.num_actual_tokens
         seq_lens = attn_metadata_router.seq_lens
+        # Cumulative query ends, windowed to the seq_lens rows: the entries are per-request end offsets whether
+        # the metadata stores a zero-prefixed `query_start_loc` (MHA/MLA) or plain `cum_query_lens` (SFA/DSA).
         cum_query_lens = attn_metadata_router.cu_query_lens[-seq_lens.size(0) :]
         query_lens = torch.diff(cum_query_lens, prepend=seq_lens.new_zeros(1))
         cached_lens = torch.clamp(seq_lens - query_lens, min=0)
         block_tables = attn_metadata_router.block_tables
-        num_reqs = max(1, (block_tables[:, 0] != 0).sum().item())  # number of non-empty requests
+        # xlite takes no padding, so drop every padded request the runners may have appended. All padding
+        # schemes append dummy requests AFTER the real ones — V1 `_pad_query_start_loc_for_fia` pads FULL-graph
+        # decode batches and sparse-parallel (SP/DSA-CP) eager batches, while V2 pads `query_start_loc` only for
+        # FULL-graph replay, which never calls the model — and the dummies' cumulative query ends reach beyond
+        # `num_actual_tokens` while real request ends never do. The V2-only synthetic append in the MHA builder
+        # (`attention_v1.py`) also pads `seq_lens` and block-table rows, but it fires only when the padded input
+        # outgrows the last per-request query end — a graph-padded state that either replays a FULL graph without
+        # calling the model or runs under the worker's xlite bypass — so it never reaches this wrapper.
+        num_reqs = max(int((cum_query_lens <= num_actual_tokens).sum().item()), 1)
+
+        # Rows handed to xlite: the true token count, or exactly one token for a DP dummy batch.
+        num_forward_tokens = 1 if self._is_dummy_batch else num_actual_tokens
 
         xlite_attn_metadata = AttnMeta()
-        xlite_attn_metadata.lens = query_lens[:num_reqs].tolist()
-        xlite_attn_metadata.cached_lens = cached_lens[:num_reqs].tolist()
-        xlite_attn_metadata.block_tables_cpu = block_tables[:num_reqs].tolist()
+        if self._is_dummy_batch:
+            # A DP dummy rank runs `execute_dummy_batch` through the xlite forward only to keep its collective
+            # contribution aligned: xlite requires a minimum of one token for one request from such a rank (a
+            # zero-row input returns before the DP collectives and hangs the peer ranks).
+            xlite_attn_metadata.lens = [1]
+            xlite_attn_metadata.cached_lens = [0]
+            xlite_attn_metadata.block_tables_cpu = block_tables[:1].tolist()
+        else:
+            xlite_attn_metadata.lens = query_lens[:num_reqs].tolist()
+            xlite_attn_metadata.cached_lens = cached_lens[:num_reqs].tolist()
+            xlite_attn_metadata.block_tables_cpu = block_tables[:num_reqs].tolist()
+            if (lens_sum := sum(xlite_attn_metadata.lens)) != num_actual_tokens:
+                logger.warning_once(
+                    "xlite: derived query lens sum (%d) != num_actual_tokens (%d, num_reqs=%d); the attention "
+                    "metadata may carry an unrecognized padding scheme.",
+                    lens_sum,
+                    num_actual_tokens,
+                    num_reqs,
+                )
         pos: torch.Tensor = torch.atleast_2d(positions)[:, :num_actual_tokens]
         xlite_attn_metadata.positions = pos.reshape(-1).reshape(pos.shape)  # rematerialize with correct stride
 
         # under DP, `num_tokens` is the max number of tokens across all DP ranks for data alignment
         h = self.hidden_states[:num_tokens]
         stream = torch.npu.current_stream().npu_stream
+        if stream == 0:
+            logger.warning_once(
+                "xlite: current stream handle is 0; xlite will fall back to blocking stream synchronization."
+            )
         input_ids = cast(torch.Tensor, input_ids)
         if inputs_embeds is None or inputs_embeds.size(0) == 0:
             self.xlite_model.forward(
                 rt=self.xlite_rt,
-                input=input_ids[:num_actual_tokens],
+                input=input_ids[:num_forward_tokens],
                 attn_meta=xlite_attn_metadata,
                 kv_cache=self.kv_caches,
                 freqs_cis=self.freq_cis,
@@ -870,7 +937,7 @@ class XliteWrapper:
                 curr_stream=stream,
             )
         else:
-            inputs_embeds = inputs_embeds[:num_actual_tokens]
+            inputs_embeds = inputs_embeds[:num_forward_tokens]
             deepstack_input_embeds = getattr(self.npu_runnable, "deepstack_input_embeds", [])
             xlite_deepstack_input_embeds = [
                 deepstack_input[: inputs_embeds.size(0)] for deepstack_input in deepstack_input_embeds
@@ -889,6 +956,16 @@ class XliteWrapper:
                 _clear_stack := getattr(self.npu_runnable, "_clear_deepstack_input_embeds", None)
             ):
                 _clear_stack(inputs_embeds.size(0))
+        if self.use_v2_model_runner:
+            # V2 hands the model padded input views (`num_tokens_after_padding` rows) and its consumers require
+            # exactly that many output rows — e.g. the MTP speculator's `hidden_states[:num_tokens_padded].copy_`
+            # cannot broadcast a different first dimension. This equals `num_actual_tokens` in the eager modes
+            # xlite runs under V2, and the capture bucket under (explicitly configured) PIECEWISE.
+            return h[:num_padded_input_tokens]
+        if self.data_parallel_size > 1:
+            # V1 MTP drafter contract (PR #16669): with DP > 1 the draft batch is DP-uniform (max-token-shaped),
+            # so the target must return max-across-DP rows even on ranks holding fewer actual tokens.
+            return h[:num_tokens]
         return h[:num_actual_tokens]
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | torch.nn.Module:

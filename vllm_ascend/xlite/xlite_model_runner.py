@@ -138,20 +138,26 @@ class XliteModelRunner(XliteModelRunnerMixin, NPUModelRunner):  # type: ignore[m
         # but this should be fine since they are both long-lived objects
         self.model = self.runner_model = self.runner_cls(self, self.vllm_config, device=self.device)  # type: ignore[assignment]
 
-    def _dummy_run(
-        self, *args: Any, is_profile: bool = False, is_graph_capturing: bool = False, **kwargs: Any
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def _dummy_run(self, *args: Any, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
         """Route dummy/profile runs to the native runnable, bypassing the xlite wrapper.
 
         See :meth:`_bypass_xlite_wrapper` for why dummy runs must not trigger the xlite forward. Delegates every
-        argument to the base implementation unchanged.
+        argument to the base implementation unchanged. The guards read keyword arguments only: every existing
+        caller passes them as keywords (the V1 base signatures even disagree on ``uniform_decode``'s positional
+        slot, so positional form would be ambiguous), and a stray positional pass would at worst leave a guard
+        unseen — degrading toward the pre-fix behavior, never crashing on re-passed keywords.
         """
-        if not is_profile and not is_graph_capturing:
-            # DP `excute_dummy_batch` must be routed to xlite forward path to avoid out of sync issues
-            return super()._dummy_run(*args, is_profile=is_profile, is_graph_capturing=is_graph_capturing, **kwargs)  # type: ignore[return-value]
+        if not kwargs.get("is_profile", False) and not kwargs.get("is_graph_capturing", False):
+            # DP `execute_dummy_batch` must be routed to xlite forward path to avoid out of sync issues
+            if kwargs.get("uniform_decode") and self.runner_enabled:
+                # xlite only needs one token for one request from a dummy rank; flag the run so the wrapper
+                # clamps the dummy batch accordingly.
+                with self.runner_model.dummy_batch():
+                    return super()._dummy_run(*args, **kwargs)  # type: ignore[return-value]
+            return super()._dummy_run(*args, **kwargs)  # type: ignore[return-value]
 
         with self._bypass_xlite_wrapper():
-            return super()._dummy_run(*args, is_profile=is_profile, is_graph_capturing=is_graph_capturing, **kwargs)  # type: ignore[return-value]
+            return super()._dummy_run(*args, **kwargs)  # type: ignore[return-value]
 
     def initialize_kv_cache(
         self, kv_cache_config: KVCacheConfig, kv_cache_allocation_context: AbstractContextManager | None = None
@@ -218,18 +224,24 @@ class XliteModelRunnerV2(XliteModelRunnerMixin, NPUModelRunnerV2):  # type: igno
         # but this should be fine since they are both long-lived objects
         self.model = self.runner_model = self.runner_cls(self, self.vllm_config, device=self.device)  # type: ignore[assignment]
 
-    def _dummy_run(self, *args: Any, is_profile: bool = False, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    def _dummy_run(self, *args: Any, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
         """Route dummy/profile runs to the native runnable, bypassing the xlite wrapper.
 
         See :meth:`_bypass_xlite_wrapper` for why dummy runs must not trigger the xlite forward. Delegates every
-        argument to the base implementation unchanged.
+        argument to the base implementation unchanged. The guards read keyword arguments only; ``uniform_decode``
+        and ``is_profile`` are keyword-only in the V2 base signature, so they cannot arrive positionally here.
         """
-        if not is_profile:
-            # DP `excute_dummy_batch` must be routed to xlite forward path to avoid out of sync issues
-            return super()._dummy_run(*args, is_profile=is_profile, **kwargs)  # type: ignore[return-value]
+        if not kwargs.get("is_profile", False):
+            # DP `execute_dummy_batch` must be routed to xlite forward path to avoid out of sync issues
+            if kwargs.get("uniform_decode") and self.runner_enabled:
+                # xlite only needs one token for one request from a dummy rank; flag the run so the wrapper
+                # clamps the dummy batch accordingly.
+                with self.runner_model.dummy_batch():
+                    return super()._dummy_run(*args, **kwargs)  # type: ignore[return-value]
+            return super()._dummy_run(*args, **kwargs)  # type: ignore[return-value]
 
         with self._bypass_xlite_wrapper():
-            return super()._dummy_run(*args, is_profile=is_profile, **kwargs)  # type: ignore[return-value]
+            return super()._dummy_run(*args, **kwargs)  # type: ignore[return-value]
 
     def initialize_kv_cache(
         self, kv_cache_config: KVCacheConfig, kv_cache_allocation_context: AbstractContextManager | None = None
