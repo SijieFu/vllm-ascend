@@ -563,11 +563,14 @@ class AscendModelState(DefaultModelState):
             req_topk_buffer_active=pool_active.cpu[:num_reqs] if pool_active is not None else None,
             copy_sfa_restore_tails=restore_copy_sfa_tails,
             draft_layer_names=getattr(self, "_offload_draft_layer_names", None),
+            # Retain the per-group common attention metadata on the model state for consumers that run
+            # inside the model forward: decoder replay, and the xlite wrapper (xlite-enabled runs only —
+            # plain runs keep the upstream behaviour of not retaining anything).
             common_metadata_callback=(
                 lambda group_id, common: self._decoder_replay_common_metadata.__setitem__(group_id, common)
-                if self.decoder_replay is not None
-                else None
-            ),
+            )
+            if self.decoder_replay is not None or get_ascend_config().xlite_graph_config.enabled
+            else None,
         )
         self._prepare_decoder_replay(input_batch, cudagraph_mode, attn_groups, kv_cache_config)
         if restore_copy_sfa_tails:

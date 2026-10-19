@@ -20,7 +20,8 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Generator, Sequence
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
 import regex as re
@@ -33,14 +34,13 @@ from vllm.distributed import get_ep_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
-from xlite._C import AttnDSA, AttnMeta, AttnMHA, AttnMLA, Runtime, ScoringFuncSigmoid, ScoringFuncSoftmax
+from xlite._C import AttnDSA, AttnMetaV2, AttnMHA, AttnMLA, Runtime, ScoringFuncSigmoid, ScoringFuncSoftmax
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.rotary_embedding import AscendRotaryEmbedding
 from vllm_ascend.xlite.utils import (
     _DUMMY_TENSOR,
-    AttnMetadataRouter,
     WeightGetterConfig,
     XModel,
     XModelConfig,
@@ -50,6 +50,7 @@ from vllm_ascend.xlite.utils import (
 )
 
 if TYPE_CHECKING:
+    from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
     from vllm_ascend.worker.v1.xlite.xlite_model_runner import XliteModelRunner as XliteModelRunnerV1
     from vllm_ascend.xlite.xlite_model_runner import XliteModelRunnerV2
 
@@ -81,11 +82,6 @@ class XliteModelBase(ABC):
         rope_cossin_cache (torch.Tensor): Precomputed RoPE frequency cache tensor for rotary positional embeddings.
     """
 
-    from vllm_ascend.attention.attention_v1 import AscendMetadata
-
-    _attn_metadata_type: type | tuple[type, ...] = AscendMetadata
-    """The expected type of attention metadata in the forward context for this architecture. Used for runtime checks
-    before forwarding. See :meth:`XliteWrapper.__call__` for usage."""
     _supported_architectures: Sequence[str] | str
     """The list of model architecture names (from HuggingFace `config.json` "architectures" field) supported by this
     adapter. Used for automatic adapter selection and registration."""
@@ -94,13 +90,7 @@ class XliteModelBase(ABC):
     model: e.g., in `Glm4MoeForCausalLM`, the MLP modules need to be accessed via `.model.layers[i].mlp`, thus `mlp`."""
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
-        """Automatically register subclasses in the architecture strategy map and metadata type set."""
-        ts = getattr(cls, "_attn_metadata_type", None)
-        if ts is None or (not isinstance(ts, type) and not all(isinstance(t, type) for t in ts)):
-            raise ValueError(
-                f"XliteModel subclass {cls.__name__} must define _attn_metadata_type as a type or a tuple of types."
-            )
-
+        """Automatically register subclasses in the architecture strategy map."""
         arcs = getattr(cls, "_supported_architectures", None)
         if arcs is None:
             raise ValueError(f"XliteModel subclass {cls.__name__} must define _supported_architectures attribute.")
@@ -541,9 +531,6 @@ class Glm4MoeXliteModel(StandardXliteModel):
 class DeepseekV3XliteModel(Glm4MoeXliteModel):
     """xlite adapter for DeepseekV3 MoE architectures with MLA attention."""
 
-    from vllm_ascend.attention.mla_v1 import AscendMLAMetadata
-
-    _attn_metadata_type = AscendMLAMetadata  # type: ignore[assignment]
     _supported_architectures = ["DeepseekV3ForCausalLM"]
 
     def _build_model_config(self) -> None:
@@ -624,9 +611,6 @@ class DeepseekV3XliteModel(Glm4MoeXliteModel):
 class DeepseekV32XliteModel(DeepseekV3XliteModel):
     """xlite adapter for Deepseek-V3.2/GLM-5.x architectures with Deepseek sparse attention (DSA)."""
 
-    from vllm_ascend.attention.sfa_v1 import AscendSFAMetadata
-
-    _attn_metadata_type = AscendSFAMetadata  # type: ignore[assignment]
     _supported_architectures = ["DeepseekV32ForCausalLM", "GlmMoeDsaForCausalLM"]
 
     def _build_model_config(self) -> None:
@@ -742,6 +726,9 @@ class XliteWrapper:
         # `full_mode` only sizes the token budget (see the comment in `StandardXliteModel._build_config`).
         self.full_mode: bool = get_ascend_config().xlite_graph_config.full_mode
         self.data_parallel_size = vllm_config.parallel_config.data_parallel_size
+        # The runner generation decides the output-shape contract; see `XliteWrapper.__call__`.
+        self.use_v2_model_runner: bool = vllm_config.use_v2_model_runner
+        self._is_dummy_batch: bool = False
 
         set_dummy_tensor(torch.empty(1, device=device, dtype=vllm_config.model_config.dtype))
         self.adapter_xlite_model = get_adapter_xlite_model(npu_runner, vllm_config)  # python adapter instance
@@ -762,6 +749,21 @@ class XliteWrapper:
         self.hidden_states = torch.empty(
             self.max_tokens, xlite_config.hidden_size, device=self.device, dtype=self.adapter_xlite_model.dtype
         )
+        # Persistent one-token batch for DP dummy runs (`__call__`): an idle DP rank must contribute exactly
+        # one token for one request to keep the DP collectives aligned, so the metadata is constant. The KV
+        # write lands on block 0 / slot 0 — not provably free, as an idle rank can still own live or
+        # prefix-cached blocks; xlite's kernels have no negative-slot skip yet.
+        self._dummy_attn_metadata = AttnMetaV2()
+        self._dummy_attn_metadata.lens_cpu = [1]
+        self._dummy_attn_metadata.cached_lens_cpu = [0]
+        self._dummy_attn_metadata.lens = torch.ones(1, dtype=torch.int32, device=self.device)
+        self._dummy_attn_metadata.cached_lens = torch.zeros(1, dtype=torch.int32, device=self.device)
+        self._dummy_attn_metadata.query_start_loc = torch.tensor([0, 1], dtype=torch.int32, device=self.device)
+        # One position per rope channel: the pos_dim > 1 kernel reads rows at ptr + pitch * {1, 2}.
+        pos_dim = 3 if xlite_config.mrope_section else 1
+        self._dummy_attn_metadata.positions = torch.zeros((pos_dim, 1), dtype=torch.int64, device=self.device)
+        self._dummy_attn_metadata.slot_mapping = [torch.zeros(1, dtype=torch.int32, device=self.device)]
+        self._dummy_attn_metadata.block_tables = [torch.zeros((1, 1), dtype=torch.int32, device=self.device)]
 
         rt_pool_size = self.xlite_model.get_tensor_pool_size()
         if torch.distributed.get_rank() == 0:
@@ -800,6 +802,34 @@ class XliteWrapper:
         """
         self.kv_caches = self.adapter_xlite_model.extract_kv_cache(kv_caches)
 
+    @contextmanager
+    def dummy_batch(self) -> Generator[None, None, None]:
+        """Mark the enclosed run as a DP dummy batch.
+
+        Idle DP ranks run ``NPUWorker.execute_dummy_batch`` through the xlite forward to keep the DP collectives
+        aligned. xlite only requires such a rank to contribute a minimum of one token for one request, so while
+        the flag is set the wrapper clamps every request-derived quantity to exactly that. The DP-agreed output
+        buffer size is unaffected (see `XliteWrapper.__call__`).
+        """
+        self._is_dummy_batch = True
+        try:
+            yield
+        finally:
+            self._is_dummy_batch = False
+
+    def _common_attn_metadata(self) -> AscendCommonAttentionMetadata:
+        """Return the group-0 common attention metadata of the step being forwarded.
+
+        Both runners retain the `AscendCommonAttentionMetadata` they hand to the attention-metadata builders —
+        the raw pre-builder per-request state, in exactly the shapes xlite needs. The V2 model state keeps the
+        per-KV-cache-group dict (`_decoder_replay_common_metadata`, populated via `build_attn_metadata`'s
+        callback), the V1 runner keeps the group-0 base object under the same attribute. Group 0 is the group
+        of layer 0, whose built metadata the wrapper used to route to.
+        """
+        if (model_state := getattr(self.npu_runner, "model_state", None)) is not None:
+            return model_state._decoder_replay_common_metadata[0]
+        return self.npu_runner._decoder_replay_common_metadata
+
     def __call__(
         self,
         input_ids: torch.Tensor | None,
@@ -823,17 +853,19 @@ class XliteWrapper:
             XliteForwardResult: Forward outputs from xlite graph or the original runnable implementation.
         """
         forward_context = get_forward_context()
-        attn_metadata: Any = forward_context.attn_metadata
-        attn_metadata = attn_metadata[0] if isinstance(attn_metadata, list) else attn_metadata
-        attn_metadata = attn_metadata.get("model.layers.0.self_attn.attn", next(iter(attn_metadata.values()), None))
-        # Since v0.28.0, batches are routed by token count (max across DP ranks) instead of the batch attention
-        # state: batches within the preallocated budget run on xlite, others fall back to the native acl runnable.
+        # The pre-builder attention state both runners retain (`_common_attn_metadata`): every field xlite
+        # needs — zero-prefixed device `query_start_loc` (+host mirror), device `seq_lens` (+host mirrors),
+        # group-0 `block_table_tensor` / `slot_mapping`, and the real token/request counts.
+        common = self._common_attn_metadata()
+        # Route by token count, max across DP ranks (graph modes hold the bucket-padded count — a safe
+        # over-approximation: xlite only requires DP-uniform output rows never smaller than the rank's own
+        # token count, and pad rows are never routed to experts).
         num_tokens: int
         if (num_tokens := _EXTRA_CTX.max_tokens_across_dp) is None:
             if (dp_metadata := forward_context.dp_metadata) is not None:
                 num_tokens = dp_metadata.num_tokens_across_dp_cpu.max().item()
             else:
-                num_tokens = attn_metadata.num_actual_tokens
+                num_tokens = common.num_actual_tokens
         if num_tokens > self.max_tokens:
             if self.full_mode:
                 logger.warning_once(
@@ -844,43 +876,74 @@ class XliteWrapper:
                 )
             return self.npu_runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs)
 
-        attn_metadata_router = AttnMetadataRouter(attn_metadata=attn_metadata, device="cpu")
-        num_actual_tokens = attn_metadata_router.num_actual_tokens
-        seq_lens = attn_metadata_router.seq_lens
-        cum_query_lens = attn_metadata_router.cu_query_lens[-seq_lens.size(0) :]
-        query_lens = torch.diff(cum_query_lens, prepend=seq_lens.new_zeros(1))
-        cached_lens = torch.clamp(seq_lens - query_lens, min=0)
-        block_tables = attn_metadata_router.block_tables
-        num_reqs = max(1, (block_tables[:, 0] != 0).sum().item())  # number of non-empty requests
+        # `input_ids` / `inputs_embeds` are views of the runner's padded input buffers: their length is the
+        # padded token count — the output rows the runner's consumers expect.
+        if input_ids is not None:
+            num_padded_input_tokens = input_ids.size(0)
+        elif inputs_embeds is not None:
+            num_padded_input_tokens = inputs_embeds.size(0)
+        else:  # defensive: the model always receives at least one of the two
+            num_padded_input_tokens = common.num_actual_tokens
 
-        xlite_attn_metadata = AttnMeta()
-        xlite_attn_metadata.lens = query_lens[:num_reqs].tolist()
-        xlite_attn_metadata.cached_lens = cached_lens[:num_reqs].tolist()
-        xlite_attn_metadata.block_tables_cpu = block_tables[:num_reqs].tolist()
-        pos: torch.Tensor = torch.atleast_2d(positions)[:, :num_actual_tokens].contiguous()
-        xlite_attn_metadata.positions = pos.reshape(-1).reshape(pos.shape)  # rematerialize with correct stride
+        num_actual_tokens = common.num_actual_tokens
+        # Rows handed to xlite: the true token count, or exactly one token for a DP dummy batch.
+        num_forward_tokens = 1 if self._is_dummy_batch else num_actual_tokens
+
+        if self._is_dummy_batch:
+            xlite_attn_metadata = self._dummy_attn_metadata
+        else:
+            # Drop runner-appended padding requests (V1-only: MoE-SP eager / FULL-graph decode append dummies
+            # whose cumulative query ends exceed `num_actual_tokens`; real ends never do — a no-op on V2,
+            # which is request-exact on the eager/PIECEWISE steps xlite runs under).
+            qsl_cpu = common.query_start_loc_cpu
+            num_reqs = max(int((qsl_cpu[1 : common.num_reqs + 1] <= num_actual_tokens).sum()), 1)
+            # V1 async spec decode keeps only the optimistic `_seq_lens_cpu` upper bound: planning may
+            # over-estimate (safe — kernels read the exact device `seq_lens`).
+            seq_lens_cpu = common.seq_lens_cpu if common.seq_lens_cpu is not None else common._seq_lens_cpu
+            query_lens = torch.diff(qsl_cpu[: num_reqs + 1])
+            query_start_loc = common.query_start_loc[: num_reqs + 1]
+            # `lens` / `cached_lens` are the two tensors AttnMetaV2 mandates that no backend metadata ships;
+            # everything else passes through as-is — xlite v2 takes the persistent full-width block table, the
+            # over-long slot mapping, and 1D/2D pitched positions directly (only the used extent is read; the
+            # C++ narrows the block-table width itself).
+            lens = query_start_loc[1:] - query_start_loc[:-1]
+            xlite_attn_metadata = AttnMetaV2()
+            xlite_attn_metadata.lens_cpu = query_lens.tolist()
+            xlite_attn_metadata.cached_lens_cpu = torch.clamp(seq_lens_cpu[:num_reqs] - query_lens, min=0).tolist()
+            xlite_attn_metadata.lens = lens
+            xlite_attn_metadata.cached_lens = torch.clamp(common.seq_lens[:num_reqs] - lens, min=0)
+            xlite_attn_metadata.query_start_loc = query_start_loc
+            xlite_attn_metadata.positions = positions
+            xlite_attn_metadata.slot_mapping = [common.slot_mapping]
+            xlite_attn_metadata.block_tables = [common.block_table_tensor]
 
         # under DP, `num_tokens` is the max number of tokens across all DP ranks for data alignment
         h = self.hidden_states[:num_tokens]
         stream = torch.npu.current_stream().npu_stream
+        if stream == 0:
+            logger.warning_once(
+                "xlite: current stream handle is 0; xlite will fall back to blocking stream synchronization."
+            )
         input_ids = cast(torch.Tensor, input_ids)
         if inputs_embeds is None or inputs_embeds.size(0) == 0:
-            self.xlite_model.forward(
+            self.xlite_model.forward_v2(
                 rt=self.xlite_rt,
-                input=input_ids[:num_actual_tokens],
+                input=input_ids[:num_forward_tokens],
                 attn_meta=xlite_attn_metadata,
                 kv_cache=self.kv_caches,
-                freqs_cis=self.freq_cis,
+                freqs_cis=[self.freq_cis],
                 output=h,
                 curr_stream=stream,
             )
         else:
-            inputs_embeds = inputs_embeds[:num_actual_tokens]
+            inputs_embeds = inputs_embeds[:num_forward_tokens]
             deepstack_input_embeds = getattr(self.npu_runnable, "deepstack_input_embeds", [])
             xlite_deepstack_input_embeds = [
                 deepstack_input[: inputs_embeds.size(0)] for deepstack_input in deepstack_input_embeds
             ]
-            self.xlite_model.forward_with_inputs_embeds(
+            # Unlike `forward_v2` (whose binding takes `std::vector<at::Tensor>`), the
+            # `forward_with_inputs_embeds_v2` binding takes a single `at::Tensor` for `freqs_cis`.
+            self.xlite_model.forward_with_inputs_embeds_v2(
                 rt=self.xlite_rt,
                 input=inputs_embeds,
                 attn_meta=xlite_attn_metadata,
@@ -894,6 +957,16 @@ class XliteWrapper:
                 _clear_stack := getattr(self.npu_runnable, "_clear_deepstack_input_embeds", None)
             ):
                 _clear_stack(inputs_embeds.size(0))
+        if self.use_v2_model_runner:
+            # V2 hands the model padded input views (`num_tokens_after_padding` rows) and its consumers require
+            # exactly that many output rows — e.g. the MTP speculator's `hidden_states[:num_tokens_padded].copy_`
+            # cannot broadcast a different first dimension. This equals `num_actual_tokens` in the eager modes
+            # xlite runs under V2, and the capture bucket under (explicitly configured) PIECEWISE.
+            return h[:num_padded_input_tokens]
+        if self.data_parallel_size > 1:
+            # V1 MTP drafter contract (PR #16669): with DP > 1 the draft batch is DP-uniform (max-token-shaped),
+            # so the target must return max-across-DP rows even on ranks holding fewer actual tokens.
+            return h[:num_tokens]
         return h[:num_actual_tokens]
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | torch.nn.Module:
