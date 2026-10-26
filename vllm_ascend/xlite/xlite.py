@@ -742,6 +742,7 @@ class XliteWrapper:
         # `full_mode` only sizes the token budget (see the comment in `StandardXliteModel._build_config`).
         self.full_mode: bool = get_ascend_config().xlite_graph_config.full_mode
         self.data_parallel_size = vllm_config.parallel_config.data_parallel_size
+        self.speculative: bool = vllm_config.speculative_config is not None
 
         set_dummy_tensor(torch.empty(1, device=device, dtype=vllm_config.model_config.dtype))
         self.adapter_xlite_model = get_adapter_xlite_model(npu_runner, vllm_config)  # python adapter instance
@@ -850,6 +851,15 @@ class XliteWrapper:
         cum_query_lens = attn_metadata_router.cu_query_lens[-seq_lens.size(0) :]
         query_lens = torch.diff(cum_query_lens, prepend=seq_lens.new_zeros(1))
         cached_lens = torch.clamp(seq_lens - query_lens, min=0)
+        if self.speculative:
+            # Spec keeps `seq_lens` optimistic (rejected draft tokens still counted as cached, cf.
+            # gpu_model_runner._prepare_inputs); each request's first position is its true cached
+            # length, so cap by it. Row 0 (mrope) and this step's tokens only — the D2H copies
+            # just the indexed slice. Request i starts at `cum_query_lens[i - 1]` (0 for i = 0;
+            # the leading 0 was dropped by the `[-N:]` slice above).
+            first_pos = torch.atleast_2d(positions)[0, :num_actual_tokens].to("cpu")
+            req_starts = torch.cat([cum_query_lens.new_zeros(1), cum_query_lens[:-1]]).clamp(max=first_pos.numel() - 1)
+            cached_lens = torch.minimum(cached_lens, first_pos[req_starts].to(cached_lens.dtype))
         block_tables = attn_metadata_router.block_tables
         num_reqs = max(1, (block_tables[:, 0] != 0).sum().item())  # number of non-empty requests
 
