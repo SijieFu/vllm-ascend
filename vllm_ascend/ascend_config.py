@@ -569,8 +569,9 @@ class AscendConfig:
     # FULL graphs wait on descriptor-specific external events at consumers.
     # Default to overlap on A5 only; explicit settings override this policy.
     multistream_engram_overlap: bool = dataclasses.field(
-        default_factory=lambda: get_current_hardware_profile().device_adaptor_family
-        == DeviceAdaptorFamily.FP8_OPTIMIZED
+        default_factory=lambda: (
+            get_current_hardware_profile().device_adaptor_family == DeviceAdaptorFamily.FP8_OPTIMIZED
+        )
     )
     enable_prefill_mc2: bool = False
     multistream_overlap_shared_expert: bool = False
@@ -1468,11 +1469,20 @@ class XliteGraphConfig:
 
         if spec := vllm_config.speculative_config:
             # only support speculative methods with a sequential causal chain, e.g., `bonus_token, mtp_1, mtp_2, ...`
-            logger.info_once("xlite graph only supports MTP speculative methods, current method: %s.", spec.method)
-            if (meth := str(spec.method)) not in ("mtp", "draft_model", "extract_hidden_states"):
+            logger.info_once(
+                "xlite graph supports MTP, EAGLE3, extract_hidden_states, dflash, dspark speculative methods, "
+                "current method: %s.",
+                spec.method,
+            )
+            if (meth := str(spec.method)) not in (
+                "mtp",
+                "draft_model",
+                "extract_hidden_states",
+                "eagle3",
+                "dflash",
+                "dspark",
+            ):
                 raise RuntimeError("xlite graph only supports SpecDecode with a sequential causal chain.")
-            if meth in ("eagle3", "extract_hidden_states", "dflash", "dspark"):
-                raise RuntimeError("xlite graph does not support SpecDecode methods with intermediate hidden states.")
             if meth == "draft_model":
                 logger.warning_once("xlite graph may not be compatible with SpecDecode using draft_model.")
         if vllm_config.parallel_config.pipeline_parallel_size > 1:

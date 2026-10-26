@@ -29,6 +29,7 @@ import torch
 import torch.nn as nn
 from vllm.logger import logger
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import get_eagle3_aux_layers_from_config
 
 from vllm_ascend.worker.v1.model_runner import NPUModelRunner
 from vllm_ascend.xlite.utils import _TensorRepr
@@ -59,6 +60,10 @@ class XliteModelRunner(XliteModelRunnerMixin, NPUModelRunner):  # type: ignore[m
         # NOTE: this will create a circular reference between XliteModelRunner and XliteWrapper instances,
         # but this should be fine since they are both long-lived objects
         self.model = self.runner_model = self.runner_cls(self, self.vllm_config, device=self.device)  # type: ignore[assignment]
+        if getattr(self, "use_aux_hidden_state_outputs", False):
+            # super().load_model wired aux layers on the fallback; re-apply to the wrapper.
+            layers = get_eagle3_aux_layers_from_config(self.speculative_config)
+            self.model.set_aux_hidden_state_layers(layers or self.model.get_eagle3_default_aux_hidden_state_layers())
 
     def _dummy_run(
         self, *args: Any, is_profile: bool = False, is_graph_capturing: bool = False, **kwargs: Any
