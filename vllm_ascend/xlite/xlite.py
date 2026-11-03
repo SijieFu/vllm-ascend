@@ -33,6 +33,7 @@ from vllm.distributed import get_ep_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
+from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import get_eagle3_aux_layers_from_config
 from xlite._C import AttnDSA, AttnMeta, AttnMHA, AttnMLA, Runtime, ScoringFuncSigmoid, ScoringFuncSoftmax
 
 from vllm_ascend.ascend_config import get_ascend_config
@@ -129,6 +130,8 @@ class XliteModelBase(ABC):
         self.vllm_config = vllm_config
         self.device = self.npu_runner.device
         self.dtype = vllm_config.model_config.dtype
+        # full mode: xlite handle all mixed and decode batches; otherwise, xlite only handle decode batches (roughly)
+        self.full_mode: bool = get_ascend_config().xlite_graph_config.full_mode
         self.rottary_embed: AscendRotaryEmbedding | None = self._get_rope()
         if self.rottary_embed:
             logger.info_once(
@@ -371,20 +374,34 @@ class StandardXliteModel(XliteModelBase):
         xlite_config.attn_type = AttnMHA
         xlite_config.scoring_func = ScoringFuncSoftmax
         xlite_config.weight_nz = get_ascend_config().weight_nz_mode == 2
-        max_m = vllm_config.scheduler_config.max_num_batched_tokens
-        if not get_ascend_config().xlite_graph_config.full_mode:
-            # decode-sized token budget: max_num_seqs * (1 + num_speculative_tokens) instead of max_num_batched_tokens
-            n_spec_tokens = getattr(vllm_config.speculative_config, "num_speculative_tokens", 0)
-            max_m = min(max_m, vllm_config.scheduler_config.max_num_seqs * (n_spec_tokens + 1))
-        xlite_config.max_m = (max_m + tp_size - 1) // tp_size * tp_size  # round up to nearest multiple of tp_size
-        xlite_config.max_batch_size = vllm_config.scheduler_config.max_num_seqs
         xlite_config.max_seq_len = vllm_config.model_config.max_model_len
         xlite_config.block_size = vllm_config.cache_config.block_size
+
+        # configure runtime token budgets between xlite full/decode-only modes with respect to speculative decoding
+        # NOTE: for profiling runs (e.g., graph capturing), the following configurations might need further adjustments
+        scheduler_config, spec_config = vllm_config.scheduler_config, vllm_config.speculative_config
+        max_num_active_seqs = getattr(scheduler_config, "max_num_active_seqs", None) or scheduler_config.max_num_seqs
+        xlite_config.max_batch_size = vllm_config.scheduler_config.max_num_seqs
+        xlite_config.num_spec_tokens = num_spec_tokens = spec_config.num_speculative_tokens if spec_config else 0
+        draft_slots = spec_config.max_num_new_slots_for_drafting if spec_config else 0
+        max_num_batched_tokens = scheduler_config.max_num_batched_tokens
+        max_num_scheduled_tokens = scheduler_config.max_num_scheduled_tokens or max_num_batched_tokens
+        max_num_scheduled_tokens = min(max_num_scheduled_tokens, max_num_batched_tokens)
+        if self.full_mode:
+            max_m = max_num_batched_tokens  # all request must confine to this budget per forward pass
+        else:
+            # xlite only handles decode batches - drafter's additional slots consume the same scheduler input budget
+            max_m = max(
+                min(n * (num_spec_tokens + 1), max_num_scheduled_tokens, max_num_batched_tokens - n * draft_slots)
+                for n in range(1, max_num_active_seqs + 1)
+            )
+        xlite_config.max_m = (max_m + tp_size - 1) // tp_size * tp_size  # round up to nearest multiple of tp_size
 
         rope_parameters = getattr(hf_config, "rope_parameters", {})
         xlite_config.deepstack_num_level = len(getattr(self.hf_vision_config, "deepstack_visual_indexes", []))
         xlite_config.mrope_section = rope_parameters.get("mrope_section", [])
         xlite_config.mrope_interleaved = rope_parameters.get("mrope_interleaved", False)
+        xlite_config.aux_layer_ids = self._resolve_aux_layer_ids()
         self.quantization = vllm_config.quant_config is not None
 
     def _build_model(self) -> None:
@@ -502,10 +519,21 @@ class StandardXliteModel(XliteModelBase):
         return super()._precompute_rope_cache().to(dtype=self.dtype, device=self.device)
 
     def extract_kv_cache(self, kv_caches: list[torch.Tensor], /) -> list[tuple[torch.Tensor, ...]]:
-        kv_caches = kv_caches[: 2 * self.xlite_config.n_layers]
-        if wrong_dims := set(cache.shape[-1] for cache in kv_caches) - set([self.xlite_config.head_dim]):
-            raise ValueError(f"xlite: kv_cache dimension mismatch (wrong dims: {', '.join(map(str, wrong_dims))})")
+        kv_caches = [c for c in kv_caches if c.shape[-1] == self.xlite_config.head_dim]
+        kv_caches = kv_caches[: 2 * (n_layers := self.xlite_config.n_layers)]
+        if len(kv_caches) != 2 * n_layers:
+            raise ValueError(f"failed to extract KV cache: expected {2 * n_layers} tensors, got {len(kv_caches)}")
         return [(k_cache, v_cache) for k_cache, v_cache in zip(kv_caches[0::2], kv_caches[1::2])]
+
+    def _resolve_aux_layer_ids(self) -> list[int]:
+        """EAGLE3 aux capture layers from the spec config (or the loaded model's default)."""
+        spec_config = self.vllm_config.speculative_config
+        if spec_config is None or not getattr(self.npu_runner, "use_aux_hidden_state_outputs", False):
+            return []
+        layers = get_eagle3_aux_layers_from_config(spec_config)
+        if not layers:
+            layers = self.npu_runner.model.get_eagle3_default_aux_hidden_state_layers()  # type: ignore[attr-defined]
+        return list(layers)
 
 
 class QwenMoeXliteModel(StandardXliteModel):
@@ -744,7 +772,6 @@ class XliteWrapper:
         """
         self.npu_runner: XliteModelRunner = npu_runner
         self.npu_runnable: nn.Module = npu_runner.fallback_model
-        self.npu_update_stream: torch.npu.Stream | None = getattr(npu_runner, "update_stream", None)
         self.device = device
         # `full_mode` only sizes the token budget (see the comment in `StandardXliteModel._build_config`).
         self.full_mode: bool = get_ascend_config().xlite_graph_config.full_mode
@@ -770,6 +797,15 @@ class XliteWrapper:
         self.hidden_states = torch.empty(
             self.max_tokens, xlite_config.hidden_size, device=self.device, dtype=self.adapter_xlite_model.dtype
         )
+        # One [max_tokens, hidden_size] capture buffer per aux layer baked into the xlite
+        # config (see `StandardXliteModel._build_model_config`); empty = capture disabled.
+        self.aux_hidden_state_layers: tuple[int, ...] = tuple(xlite_config.aux_layer_ids)
+        self.aux_hidden_states: list[torch.Tensor] = [
+            torch.empty(
+                self.max_tokens, xlite_config.hidden_size, device=self.device, dtype=self.adapter_xlite_model.dtype
+            )
+            for _ in self.aux_hidden_state_layers
+        ]
 
         rt_pool_size = self.xlite_model.get_tensor_pool_size()
         if torch.distributed.get_rank() == 0:
@@ -780,8 +816,9 @@ class XliteWrapper:
     def __del__(self) -> None:
         self.npu_runner = None  # type: ignore[assignment]
         self.npu_runnable = None  # type: ignore[assignment]
-        self.adapter_xlite_model.npu_runner = None  # type: ignore[assignment]
-        self.adapter_xlite_model.xlite_model = None  # type: ignore[assignment]
+        if getattr(self, "adapter_xlite_model", None) is not None:
+            self.adapter_xlite_model.npu_runner = None  # type: ignore[assignment]
+            self.adapter_xlite_model.xlite_model = None  # type: ignore[assignment]
 
     def __getattr__(self, key: str) -> Any:
         """Proxy unknown attributes to the wrapped runnable model.
@@ -852,11 +889,6 @@ class XliteWrapper:
                 )
             return self.npu_runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs)
 
-        # sync the device streams to avoid stale D2H copies in metadata preparation
-        curr_stream = torch.npu.current_stream()
-        if self.npu_update_stream is not None and self.npu_update_stream != curr_stream:
-            curr_stream.wait_stream(self.npu_update_stream)
-
         attn_metadata_router = AttnMetadataRouter(attn_metadata=attn_metadata, device="cpu")
         num_actual_tokens = attn_metadata_router.num_actual_tokens
         seq_lens = attn_metadata_router.seq_lens
@@ -884,6 +916,7 @@ class XliteWrapper:
         # under DP, `num_tokens` is the max number of tokens across all DP ranks for data alignment
         h = self.hidden_states[:num_tokens]
         input_ids = cast(torch.Tensor, input_ids)
+        # an empty aux list disables capture in the bindings
         if inputs_embeds is None or inputs_embeds.size(0) == 0:
             self.xlite_model.forward(
                 rt=self.xlite_rt,
@@ -892,7 +925,8 @@ class XliteWrapper:
                 kv_cache=self.kv_caches,
                 freqs_cis=self.freq_cis,
                 output=h,
-                curr_stream=curr_stream.npu_stream,
+                aux_outputs=self.aux_hidden_states,
+                curr_stream=torch.npu.current_stream().npu_stream,
             )
         else:
             inputs_embeds = inputs_embeds[:num_actual_tokens]
@@ -907,14 +941,18 @@ class XliteWrapper:
                 kv_cache=self.kv_caches,
                 freqs_cis=self.freq_cis,
                 output=h,
-                curr_stream=curr_stream.npu_stream,
+                aux_outputs=self.aux_hidden_states,
+                curr_stream=torch.npu.current_stream().npu_stream,
                 deepstack_input=xlite_deepstack_input_embeds,
             )
             if deepstack_input_embeds and callable(
                 _clear_stack := getattr(self.npu_runnable, "_clear_deepstack_input_embeds", None)
             ):
                 _clear_stack(inputs_embeds.size(0))
-        return h[:num_actual_tokens]
+        h_out = h[:num_actual_tokens]
+        if self.aux_hidden_state_layers:
+            return h_out, [aux[:num_actual_tokens] for aux in self.aux_hidden_states]
+        return h_out
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | torch.nn.Module:
         # TODO: consider implementing a custom logits computation path for xlite to avoid falling back to the native
